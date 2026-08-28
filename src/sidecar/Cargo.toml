@@ -29,7 +29,6 @@ cuda-13 = [
 [dependencies]
 nixie_common = { path = "../common", default-features = false }
 bincode.workspace = true
-nix.workspace = true
 tarpc.workspace = true
 futures.workspace = true
 colored.workspace = true
@@ -44,3 +43,9 @@ chrono = "0.4.38"
 flume = "0.11.1"
 
 cfg-if = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

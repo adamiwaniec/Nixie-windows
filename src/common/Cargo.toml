@@ -14,7 +14,6 @@ cuda-12 = ["cudarc/cuda-12000", "cudarc/fallback-dynamic-loading"]
 cuda-13 = ["cudarc/cuda-13000", "cudarc/fallback-dynamic-loading"]
 
 [dependencies]
-nix.workspace = true
 tarpc.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -22,3 +21,9 @@ cudarc.workspace = true
 tokio = { version = "1" }
 
 futures = "0.3.31"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
