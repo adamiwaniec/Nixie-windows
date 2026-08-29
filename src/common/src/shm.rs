@@ -1,13 +1,21 @@
-use core::{ffi::c_int, pin::Pin};
+use core::{ffi::c_void, pin::Pin};
 use std::num::NonZeroU32;
 
-use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use crate::{HANDLE_NUM, MAX_GPUS, sync::IpcMutex};
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+};
+use windows::core::PCWSTR;
+
 /// There should be no side effects of the drop.
 pub(crate) trait ReInitializable {
+    // receiver is freshly mapped and uninitialized so its fields hold
+    // arbitrary data. overwrite them, never read or drop them. call one time
     unsafe fn reinit_from_uninited(&mut self);
 }
 
@@ -209,102 +217,129 @@ impl Default for AllocationEntry {
     }
 }
 
+fn region_hash(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish()
+}
+
 impl Shm {
     pub const SHM_STRUCT_SIZE: u32 = core::mem::size_of::<Self>() as u32;
 
-    pub fn init_at(shm_fd: i32, len: u32) -> Result<Pin<&'static mut Self>, c_int> {
-        if len < core::mem::size_of::<Self>() as u32 {
-            return Err(libc::EINVAL);
+    pub fn init_at(name: &str, len: u32) -> Result<ShmGuard, std::io::Error> {
+        if len < Self::SHM_STRUCT_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shm region smaller than Shm",
+            ));
         }
-        unsafe {
-            // extend shmem
-            let errno = libc::ftruncate(shm_fd, len as i64);
-            if errno != 0 {
-                return Err(errno);
-            }
-            // create mmap
-            let ptr = libc::mmap(
-                core::ptr::null_mut(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                shm_fd,
+
+        let wide: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        // len is a u32 so the high dword is always 0
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
                 0,
-            );
-            if ptr == libc::MAP_FAILED {
-                return Err(nix::errno::Errno::last_raw());
-            }
-            let typed_ptr = ptr as *mut Self;
-            let mut_ref = &mut *typed_ptr;
+                len,
+                PCWSTR(wide.as_ptr()),
+            )
+        }
+        .map_err(|_| std::io::Error::last_os_error())?;
+
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, len as usize) };
+        if view.Value.is_null() {
+            let e = std::io::Error::last_os_error();
+            unsafe {
+                let _ = CloseHandle(mapping);
+            };
+            return Err(e);
+        }
+
+        // 1 hash per region and 1 id per lock derived off it, so the locks in a region 
+        // cannot collide with each other or with another region
+        let hash = region_hash(name);
+        unsafe {
+            let mut_ref = &mut *(view.Value as *mut Self);
             mut_ref.all_len = len;
-            for table in mut_ref.alloc_tables.iter_mut() {
-                table.reinit_from_uninited();
+            for (i, table) in mut_ref.alloc_tables.iter_mut().enumerate() {
+                table.reinit_with_id(hash.wrapping_mul(MAX_GPUS as u64) + i as u64);
             }
-            Ok(Pin::new(mut_ref))
+            Ok(ShmGuard {
+                inner: Pin::new(mut_ref),
+                mapping,
+            })
         }
     }
 
     /// # Safety
-    ///
-    /// This involves mmap
-    pub unsafe fn open_copy_at(shm_fd: i32, len: u32) -> Result<Pin<&'static mut Self>, c_int> {
-        if len < core::mem::size_of::<Self>() as u32 {
-            return Err(libc::EINVAL);
+    /// maps shared memory. region must have been initialized by init_at()
+    pub unsafe fn open_copy_at(name: &str, len: u32) -> Result<ShmGuard, std::io::Error> {
+        if len < Self::SHM_STRUCT_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "shm region smaller than Shm",
+            ));
         }
-        // create mmap
-        let ptr = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                shm_fd,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            Err(nix::errno::Errno::last_raw())
-        } else {
-            let r = unsafe { Pin::new(&mut *(ptr as *mut Self)) };
-            for alloc_table in r.alloc_tables.iter() {
-                // Increase ref count for each allocation table
+
+        let wide: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        let mapping =
+            unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, PCWSTR(wide.as_ptr())) }
+                .map_err(|_| std::io::Error::last_os_error())?;
+
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, len as usize) };
+        if view.Value.is_null() {
+            let e = std::io::Error::last_os_error();
+            unsafe {
+                let _ = CloseHandle(mapping);
+            };
+            return Err(e);
+        }
+
+        unsafe {
+            let mut_ref = &mut *(view.Value as *mut Self);
+            for alloc_table in mut_ref.alloc_tables.iter() {
                 alloc_table.increase_ref_count();
             }
-            Ok(r)
+            Ok(ShmGuard {
+                inner: Pin::new(mut_ref),
+                mapping,
+            })
         }
     }
 
     unsafe fn close(&mut self) {
         unsafe {
             for alloc_table in self.alloc_tables.iter_mut() {
-                // Decrease ref count for each allocation table
+                // decrement ref count for each allocation table
                 alloc_table.close();
             }
-            libc::munmap(
-                self as *const Self as *mut libc::c_void,
-                self.all_len as usize,
-            );
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self as *const Self as *mut c_void,
+            });
         }
     }
 }
 
 pub struct ShmGuard {
     pub inner: Pin<&'static mut Shm>,
-}
-
-impl ShmGuard {
-    pub fn new(shm: Pin<&'static mut Shm>) -> Self {
-        Self { inner: shm }
-    }
+    mapping: HANDLE,
 }
 
 impl Drop for ShmGuard {
     fn drop(&mut self) {
         unsafe {
-            self.inner.close();
+            self.inner.close(); // refcounts, then unmaps
+            let _ = CloseHandle(self.mapping);
         }
     }
 }
+
+// same as ShmBuffer. the handle is process-wide, not owned by one thr
+unsafe impl Send for ShmGuard {}
+unsafe impl Sync for ShmGuard {}
 
 pub struct ShmVec<T: Default, const N: usize> {
     len: u32,

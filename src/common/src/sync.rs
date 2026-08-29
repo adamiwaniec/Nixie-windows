@@ -1,25 +1,32 @@
 use core::{cell::UnsafeCell, sync::atomic::AtomicU8};
-use nix::libc;
+
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{
+    CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
+};
+use windows::core::PCWSTR;
 
 use crate::shm::ReInitializable;
 
+// lives in shared mem
 pub struct IpcMutex<T> {
-    lock: libc::sem_t,
+    /*  sem_t used to live here bc it can be managed in shared mem from user-space.
+        but win32 mutex is a kernel obj, so we store an id that can be used to
+        derive the same name
+    */
+    id: u64,
     ref_count: AtomicU8,
     inner: UnsafeCell<T>,
 }
 
 impl<T> IpcMutex<T> {
-    pub fn new(val: T) -> Self {
-        let mut v = Self {
-            inner: UnsafeCell::new(val),
-            ref_count: AtomicU8::new(1),
-            lock: unsafe { core::mem::zeroed() },
-        };
-        unsafe {
-            libc::sem_init(&mut v.lock, 1, 1);
-        }
-        v
+    // CreateMutexW is create-or-open so both processes just call this func
+    fn open_mutex(&self) -> HANDLE {
+        //Local\ is the per-session namespace
+        // this needs Global once daemon runs as a service (session 0)
+        let name = format!("Local\\nixie-mtx-{:016x}", self.id);
+        let wide: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }.expect("CreateMutexW failed")
     }
 
     pub fn increase_ref_count(&self) {
@@ -27,51 +34,51 @@ impl<T> IpcMutex<T> {
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
-    fn lock_inner(&self) {
-        loop {
-            let ret = unsafe { libc::sem_wait(&self.lock as *const _ as *mut _) };
-            match ret {
-                0 => break,
-                libc::EINTR => continue,
-                _ => panic!("sem_wait failed: {}", nix::errno::Errno::last()),
-            }
-        }
-    }
-
-    fn unlock_inner(&self) {
-        let ret = unsafe { libc::sem_post(&self.lock as *const _ as *mut _) };
-        if ret != 0 {
-            panic!("sem_post failed: {}", nix::errno::Errno::last());
-        }
-    }
-
     pub fn lock(&'_ self) -> IpcMutexGuard<'_, T> {
-        self.lock_inner();
-        IpcMutexGuard { lock: self }
+        let handle = self.open_mutex();
+        match unsafe { WaitForSingleObject(handle, INFINITE) } {
+            WAIT_OBJECT_0 => {}
+
+            // we get the lock since owner died holding it.
+            // in the old linux sem_wait, a dead owner just held the semaphore forever.
+            WAIT_ABANDONED => {
+                eprintln!(
+                    "NIXIE-WARN: IpcMutex {:#x} abandoned by a dead owner",
+                    self.id
+                );
+            }
+            other => panic!(
+                "WaitForSingleObject on IpcMutex {:#x} failed: {:?}, last error {}",
+                self.id,
+                other,
+                std::io::Error::last_os_error()
+            ),
+        }
+        IpcMutexGuard { lock: self, handle }
+    }
+
+    /// # Safety
+    /// self must point into a mapped region big enough
+    pub(crate) unsafe fn reinit_with_id(&mut self, id: u64)
+    // id is passed in since only the creator knows the region name that it hashes from.
+    // openers will just read it back out of the mapping.
+    where
+        T: ReInitializable,
+    {
+        self.id = id;
+        self.ref_count = AtomicU8::new(1);
+        unsafe { self.inner.get_mut().reinit_from_uninited() };
     }
 
     /// # Safety
     ///
-    /// This involves libc::semaphore
+    /// drops a ref to the lock
     pub unsafe fn close(&mut self) {
-        let old_ref_count = self
-            .ref_count
+        // no sem_destroy equivalent. kernel will free the mutex once the last handle
+        // closes, and the guard already closes ours.
+        // the refcount is only kept for the callers that still read it
+        self.ref_count
             .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-        if old_ref_count == 1 {
-            unsafe { libc::sem_destroy(&mut self.lock) };
-        }
-    }
-}
-
-impl<T: ReInitializable> ReInitializable for IpcMutex<T> {
-    unsafe fn reinit_from_uninited(&mut self) {
-        unsafe {
-            self.ref_count = AtomicU8::new(1);
-            self.lock = core::mem::zeroed();
-            libc::sem_init(&mut self.lock, 1, 1);
-            // Safety: T and UnsafeCell<T> share the same memory layout.
-            self.inner.get_mut().reinit_from_uninited();
-        }
     }
 }
 
@@ -79,11 +86,17 @@ unsafe impl<T: Sync> Sync for IpcMutex<T> {}
 
 pub struct IpcMutexGuard<'a, T> {
     lock: &'a IpcMutex<T>,
+    handle: HANDLE,
 }
 
 impl<T> Drop for IpcMutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.unlock_inner();
+        unsafe {
+            if let Err(e) = ReleaseMutex(self.handle) {
+                eprintln!("NIXIE-WARN: ReleaseMutex failed: {e}");
+            }
+            let _ = CloseHandle(self.handle);
+        }
     }
 }
 

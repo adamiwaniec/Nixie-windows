@@ -1,10 +1,17 @@
-use nix::libc;
+use core::ffi::c_void;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+};
+use windows::core::PCWSTR;
 
 pub struct ShmBuffer {
     // control data
-    shm_path: String,
-    shm_fd: i32,
-    is_creator: bool,
+    // shm_path and is_creator deleted. they only existed so Drop could shm_unlink.
+    // A section has no filesystem entry and dies with its last handle, so there is
+    // nothing we need to unlink and nothing to remember
+    mapping: HANDLE,
     // buffer
     shm_addr: u64,
     shm_size: usize,
@@ -12,50 +19,48 @@ pub struct ShmBuffer {
 
 impl ShmBuffer {
     pub fn new(shm_path: &str, shm_size: usize, is_creator: bool) -> Result<Self, std::io::Error> {
-        let oflag = if is_creator {
-            libc::O_RDWR | libc::O_CREAT
+        let wide: Vec<u16> = shm_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let name = PCWSTR(wide.as_ptr());
+
+        let size_high = (shm_size >> 32) as u32;
+        let size_low = (shm_size & 0xFFFF_FFFF) as u32;
+
+        let mapping = if is_creator {
+            // INVALID_HANDLE_VALUE means page-file backed, ie anonymous shared memory.
+            // size is fixed here, so there is no ftruncate step.
+            unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    None,
+                    PAGE_READWRITE,
+                    size_high,
+                    size_low,
+                    name,
+                )
+            }
         } else {
-            libc::O_RDWR
-        };
-        let cstr_shm_path = std::ffi::CString::new(shm_path).unwrap();
-        let shm_fd =
-            unsafe { libc::shm_open(cstr_shm_path.as_ptr(), oflag, libc::S_IRUSR | libc::S_IWUSR) };
-        if shm_fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            // no size argument bc the openers size only shows up in MapViewOfFile below,
+            // so, asking for more than the creator made fails, and asking for less
+            // just maps a prefix of it. callers must agree on the size beforehand
+            unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, name) }
         }
+        .map_err(|_| std::io::Error::last_os_error())?;
 
-        if unsafe { libc::ftruncate(shm_fd, shm_size as libc::off_t) } < 0 {
-            unsafe { libc::close(shm_fd) };
-            if is_creator {
-                unsafe { libc::shm_unlink(cstr_shm_path.as_ptr()) };
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, shm_size) };
+        if view.Value.is_null() {
+            // save the error before closehandle bc it will get overwritten
+            let e = std::io::Error::last_os_error();
+            unsafe {
+                let _ = CloseHandle(mapping);
             }
-            return Err(std::io::Error::last_os_error());
+            return Err(e);
         }
-
-        let shm_addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                shm_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                shm_fd,
-                0,
-            )
-        };
-        if shm_addr == libc::MAP_FAILED {
-            unsafe { libc::close(shm_fd) };
-            if is_creator {
-                unsafe { libc::shm_unlink(cstr_shm_path.as_ptr()) };
-            }
-            return Err(std::io::Error::last_os_error());
-        }
+        let shm_addr = view.Value as u64;
 
         Ok(Self {
-            shm_path: shm_path.to_string(),
-            shm_fd,
+            mapping,
             shm_size,
-            shm_addr: shm_addr as u64,
-            is_creator,
+            shm_addr,
         })
     }
 
@@ -76,11 +81,15 @@ impl ShmBuffer {
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.shm_addr as *mut libc::c_void, self.shm_size);
-            libc::close(self.shm_fd);
-            if self.is_creator {
-                libc::shm_unlink(self.shm_path.as_ptr() as *const i8);
-            }
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.shm_addr as *mut c_void,
+            });
+            let _ = CloseHandle(self.mapping);
         }
     }
 }
+
+// HANDLE is a process-wide token, so any thread can use it. these were derived
+// automatically on Linux, where the fields were i32 and u64
+unsafe impl Send for ShmBuffer {}
+unsafe impl Sync for ShmBuffer {}
