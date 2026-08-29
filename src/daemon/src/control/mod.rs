@@ -11,7 +11,7 @@ use crate::{
     runtime::{ClientState, Priority, PriorityLevel, migration::BufferLocation},
 };
 
-pub static CONTROL_PATH: &str = "/tmp/nixie-ctl.sock";
+pub static CONTROL_PATH: &str = r"\\.\pipe\nixie-ctl";
 
 #[tarpc::service]
 pub(crate) trait Controllable {
