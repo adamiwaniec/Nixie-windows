@@ -9,7 +9,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [features]
-default = ["cuda-system"]
+default = ["cuda-13"]
 cuda-system = [
     "nixie_common/cuda-system",
     "cudarc/cuda-version-from-build-system",
