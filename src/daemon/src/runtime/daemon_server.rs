@@ -26,8 +26,7 @@ use tarpc::{
     tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{
-    io::unix::AsyncFd,
-    net::UnixStream,
+    net::windows::named_pipe::NamedPipeServer,
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
@@ -135,7 +134,7 @@ pub(crate) struct DaemonServer {
 
 impl DaemonServer {
     pub fn launch(
-        conn: UnixStream,
+        conn: NamedPipeServer,
         exit_tx: mpsc::UnboundedSender<i32>,
         rpc_data_tx: mpsc::UnboundedSender<(i32, ScheduleRpcMessage)>,
         sched_ctl_tx: mpsc::UnboundedSender<ScheduleControlReq>,

@@ -3,7 +3,9 @@ use std::{collections::HashMap, time::Duration};
 use chrono::DateTime;
 use colored::Colorize;
 use tarpc::tokio_util::codec::LengthDelimitedCodec;
+use tokio::net::windows::named_pipe::ClientOptions;
 use tokio_serde::formats::Cbor;
+use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::{
     ProcArgs, UpdateConfigArgs,
@@ -52,9 +54,19 @@ fn get_pid_checked(args: ProcArgs, pid_list: &[i32]) -> Result<i32, ClientError>
 
 impl ControlClient {
     pub async fn new(path: &str) -> Result<Self, ClientError> {
-        let conn = tokio::net::UnixStream::connect(path)
-            .await
-            .map_err(|e| ClientError::Io("Failed to connect to control socket", e))?;
+        // 1 instance per conn so there will be a window with no free inst
+        // between connecting and the daemon creating the next one
+        let conn = loop {
+            match ClientOptions::new().open(path) {
+                Ok(conn) => break conn,
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    return Err(ClientError::Io("Failed to connect to control pipe", e));
+                }
+            }
+        };
         let conn = tarpc::serde_transport::new(
             LengthDelimitedCodec::builder().new_framed(conn),
             Cbor::default(),
@@ -116,9 +128,7 @@ impl ControlClient {
         );
         let mut list = Vec::new();
         for process in processes.into_iter() {
-            let process_name = std::fs::read_to_string(format!("/proc/{}/comm", process.pid))
-                .map(|s| s.trim().to_string())
-                .ok();
+            let process_name = crate::staticly::process_name(process.pid);
             let priority = match &process.priority {
                 Some(p) => match *p {
                     Priority::Dynamic { level, weight } => {
@@ -167,9 +177,7 @@ impl ControlClient {
         // print info
         println!("Active processes: {}", processes.len());
         for (idx, process) in processes.into_iter().enumerate() {
-            let process_name = std::fs::read_to_string(format!("/proc/{}/comm", process.pid))
-                .map(|s| s.trim().to_string())
-                .ok();
+            let process_name = crate::staticly::process_name(process.pid);
             let priority_str = match &process.priority {
                 Some(p) => match *p {
                     Priority::Dynamic { level, weight } => {
@@ -333,10 +341,8 @@ impl ControlClient {
                 println!();
             }
             for pid in sorted_pids {
-                let process_name = std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                    .map(|s| s.trim().to_string())
-                    .ok()
-                    .unwrap_or_else(|| "Unknown".to_string());
+                let process_name =
+                    crate::staticly::process_name(pid).unwrap_or_else(|| "Unknown".to_string());
                 let mut str = format!("[{}]{}; ", pid.to_string().yellow(), process_name.green());
                 for dev in processes.iter().filter(|p| p.pid == pid) {
                     for (device, allocations) in &dev.allocations {
@@ -417,10 +423,8 @@ impl ControlClient {
         let pid_list = self.get_pid_list().await?;
         let pid = get_pid_checked(pid, &pid_list)?;
 
-        let process_name = std::fs::read_to_string(format!("/proc/{}/comm", pid))
-            .map(|s| s.trim().to_string())
-            .ok()
-            .unwrap_or_else(|| "Unknown".to_string());
+        let process_name =
+            crate::staticly::process_name(pid).unwrap_or_else(|| "Unknown".to_string());
 
         let resp = self
             .client

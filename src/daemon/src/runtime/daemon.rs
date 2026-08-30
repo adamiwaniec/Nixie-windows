@@ -12,7 +12,7 @@ use tarpc::{
     tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{
-    net::UnixListener,
+    net::windows::named_pipe::{NamedPipeServer, ServerOptions},
     sync::{RwLock, mpsc},
 };
 
@@ -65,7 +65,7 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(shm_buffer_size: usize, ram_buffer_size: usize) -> Self {
         Self {
-            daemon_path: PathBuf::from("/tmp/nixie.sock"),
+            daemon_path: PathBuf::from(nixie_common::DAEMON_PIPE_NAME),
             control_path: PathBuf::from(control::CONTROL_PATH),
             buffer_path: PathBuf::from("/tmp/nixie.pagebuffer"),
             shm_buffer_size,
@@ -164,10 +164,10 @@ impl Daemon {
             });
         }
 
-        let listener_guard = UnixListenerGuard::new(&self.control_path)?;
+        let mut listener_guard = PipeListener::new(&self.control_path)?;
 
         // listen for client
-        while let Ok((stream, _)) = listener_guard.get_listener().accept().await {
+        while let Ok(stream) = listener_guard.accept().await {
             let conn = tarpc::serde_transport::new(
                 LengthDelimitedCodec::builder().new_framed(stream),
                 tarpc::tokio_serde::formats::Cbor::default(),
@@ -198,11 +198,10 @@ impl Daemon {
         shm_buffer_path: String,
         shm_buffer_size: usize,
     ) -> Result<(), DaemonError> {
-        let controller = UnixListenerGuard::new(daemon_path.as_path())?;
+        let mut controller = PipeListener::new(daemon_path.as_path())?;
         tracing::info!("Daemon started at {:?}", daemon_path);
         loop {
-            let (stream, _) = controller
-                .get_listener()
+            let stream = controller
                 .accept()
                 .await
                 .map_err(|e| DaemonError::Io("accept connection", e))?;
@@ -347,32 +346,34 @@ impl Controllable for ControllableDaemon {
 }
 // Utils
 
-struct UnixListenerGuard {
-    path: PathBuf,
-    listener: Option<UnixListener>,
+/* replaces the old UnixListenerGuard. the differences: 
+   - a pipe server is one instance per connection, 
+     so a new inst must exist before the next client can connect.
+   - there is no filesystem entry to remove afterward, so no Drop trait
+*/
+struct PipeListener {
+    name: std::ffi::OsString,
+    next: NamedPipeServer,
 }
 
-impl UnixListenerGuard {
+impl PipeListener {
+    // pipe name is stored inside PathBuf as an NT object name
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DaemonError> {
-        let path = path.as_ref().to_path_buf();
-        let listener =
-            UnixListener::bind(&path).map_err(|e| DaemonError::Io("bind listener", e))?;
-        socket_chown(&path)?;
-        Ok(Self {
-            path,
-            listener: Some(listener),
-        })
+        let name = path.as_ref().as_os_str().to_os_string();
+        // first_pipe_instance fails if name is owned by another proc
+        // rather than joining an existing pipe
+        let next = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .map_err(|e| DaemonError::Io("bind listener", e))?;
+        Ok(Self { name, next })
     }
-    pub fn get_listener(&self) -> &UnixListener {
-        self.listener.as_ref().unwrap()
-    }
-}
 
-impl Drop for UnixListenerGuard {
-    fn drop(&mut self) {
-        self.listener = None;
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            tracing::error!("Error when removing unix domain socket: {}", e)
-        }
+    pub async fn accept(&mut self) -> std::io::Result<NamedPipeServer> {
+        // waits for a client on the instance we already hold, then hands it 
+        // that one and creates the next
+        self.next.connect().await?;
+        let connected = std::mem::replace(&mut self.next, ServerOptions::new().create(&self.name)?);
+        Ok(connected)
     }
 }
