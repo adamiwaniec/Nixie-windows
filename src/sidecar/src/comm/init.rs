@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
-use tokio::net::UnixStream;
+use std::time::Duration;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use windows::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::comm::controller::Controller;
 
@@ -24,30 +26,29 @@ pub(crate) static COMM: OnceLock<Option<flume::Sender<A2SMessage>>> = OnceLock::
 
 fn init_comm_inner() -> std::io::Result<flume::Sender<A2SMessage>> {
     let (tx, rx) = flume::unbounded();
-    let conn = std::os::unix::net::UnixStream::connect("/tmp/nixie.sock")?;
-    conn.set_nonblocking(true)?;
-    std::thread::spawn(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                match tokio::net::UnixStream::from_std(conn) {
-                    Ok(conn) => create_comm(conn, rx).await,
-                    Err(e) => eprintln!(
-                        "Tokio UnixStream failed to initialize at {}:{}: {:?}",
-                        file!(),
-                        line!(),
-                        e
-                    ),
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    // pipe handles register with the runtimes io driver when they are created
+    // so this has to happen inside block_on
+    let conn = rt.block_on(async {
+        loop {
+            match ClientOptions::new().open(nixie_common::DAEMON_PIPE_NAME) {
+                Ok(conn) => break Ok(conn),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-            })
-    });
+                Err(e) => break Err(e),
+            }
+        }
+    })?;
+    std::thread::spawn(move || rt.block_on(create_comm(conn, rx)));
     Ok(tx)
 }
 
 // this function should be called in a separate thread
-async fn create_comm(conn: UnixStream, p2s_rx: flume::Receiver<A2SMessage>) {
+async fn create_comm(conn: NamedPipeClient, p2s_rx: flume::Receiver<A2SMessage>) {
     let mut codec_builder = LengthDelimitedCodec::builder();
     codec_builder.max_frame_length(64 * 1024 * 1024);
     let framed = codec_builder.new_framed(conn);
