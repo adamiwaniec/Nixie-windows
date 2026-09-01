@@ -1,5 +1,5 @@
 #![allow(non_upper_case_globals)]
-use std::{collections::HashMap, os::fd::OwnedFd};
+use std::collections::HashMap;
 
 use nixie_common::{
     MAX_GPUS, ProcessLocalDeviceId,
@@ -7,7 +7,7 @@ use nixie_common::{
     rpc::SidecarClient,
     shm::{PhysicalMemoryHandleId, ShmGuard},
 };
-use tokio::{io::unix::AsyncFd, sync::mpsc};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     control::{AllocationData, PhysicalMemoryData, ProcessMetadata, ProcessResidualData},
@@ -19,7 +19,8 @@ use super::{ProcCtlReq, daemon_server::DeviceOrdinalMapping};
 
 pub(crate) struct ProcessControl {
     peer_pid: i32,
-    pid_fd: AsyncFd<OwnedFd>,
+    // was AsyncFd<OwnedFd> over a pidfd. look at open_peer_process in daemon_server.rs
+    pid_waiter: JoinHandle<()>,
     shm: ShmGuard,
     dev_mapping: DeviceOrdinalMapping,
     rpc_sender: SidecarClient,
@@ -32,7 +33,7 @@ impl ProcessControl {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         peer_pid: i32,
-        pid_fd: AsyncFd<OwnedFd>,
+        pid_waiter: JoinHandle<()>,
         shm: ShmGuard,
         dev_mapping: DeviceOrdinalMapping,
         rpc_sender: SidecarClient,
@@ -42,7 +43,7 @@ impl ProcessControl {
     ) -> Self {
         Self {
             peer_pid,
-            pid_fd,
+            pid_waiter,
             shm,
             dev_mapping,
             rpc_sender,
@@ -66,7 +67,7 @@ impl ProcessControl {
                 Some(inst) = self.inst_rx.recv() => {
                     self.handle_inst(inst).await;
                 }
-                _ = self.pid_fd.readable() => {
+                _ = &mut self.pid_waiter => {
                     break;
                 }
             }

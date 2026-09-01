@@ -1,5 +1,5 @@
 use crate::{
-    error::{DaemonError, UvmError},
+    error::DaemonError,
     runtime::{
         proc_ctl::ProcessControl,
         schedule::{ScheduleRpcMessage, control::ScheduleControlReq},
@@ -7,7 +7,6 @@ use crate::{
     },
 };
 use futures::StreamExt;
-use nix::libc::c_int;
 use nixie_common::{
     GlobalDeviceId, HandshakeResponse, ProcessLocalDeviceId,
     rpc::{Daemon, SidecarClient, rpc_multiplex_twoway},
@@ -15,11 +14,18 @@ use nixie_common::{
 use std::{
     collections::HashMap,
     future::Future,
-    os::fd::{FromRawFd, OwnedFd},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::Arc,
     task::{Poll, ready},
 };
-use syscalls::{Sysno, syscall};
+use windows::Win32::{
+    Foundation::HANDLE,
+    System::Threading::{
+        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    },
+};
+
 use tarpc::{
     context::Context,
     server::{BaseChannel, Channel},
@@ -141,7 +147,7 @@ impl DaemonServer {
         buffer_shmem_path: String,
         buffer_len: usize,
     ) -> DaemonServerHandleFuture {
-        // construct a bidirectional RPC tunnel based on single UDS connection
+        // construct a bidirectional RPC tunnel based on single pipe connection
         let mut codec_builder = LengthDelimitedCodec::builder();
         codec_builder.max_frame_length(64 * 1024 * 1024);
         let framed = codec_builder.new_framed(conn);
@@ -231,9 +237,7 @@ impl nixie_common::rpc::Daemon for DaemonServer {
             return None;
         };
         let rpc_client = state.rpc_client.clone();
-        let process_name = std::fs::read_to_string(format!("/proc/{}/comm", params.pid))
-            .map(|s| s.trim().to_string())
-            .ok();
+        let process_name = crate::staticly::process_name(params.pid);
         tracing::info!(
             "Client[pid={}, comm={:?}] connected",
             params.pid,
@@ -241,10 +245,13 @@ impl nixie_common::rpc::Daemon for DaemonServer {
         );
 
         let peer_pid = params.pid;
-        let (pid_fd, _) = checked!(duplicate_peer_fd(peer_pid, None).map_err(|e| (e, peer_pid)));
-        let pid_fd = checked!(
-            AsyncFd::new(pid_fd).map_err(|e| (UvmError::Io("Create PID fd", e), peer_pid))
-        );
+        let pid_handle = checked!(open_peer_process(peer_pid).map_err(|e| (e, peer_pid)));
+        /* in the linux version, pidfd was pollable so it went straight into AsyncFd and the reactor.
+           a process handle isnt, so just spawn a thread to wait on it
+        */
+        let pid_waiter = tokio::task::spawn_blocking(move || {
+            unsafe { WaitForSingleObject(HANDLE(pid_handle.as_raw_handle()), INFINITE) };
+        });
 
         // open shared memory
         let shmem = checked!(open_shm(params.shm_path).map_err(|e| (e, peer_pid)));
@@ -255,7 +262,7 @@ impl nixie_common::rpc::Daemon for DaemonServer {
         ));
         let ctl = ProcessControl::new(
             peer_pid,
-            pid_fd,
+            pid_waiter,
             shmem,
             (*device_mapping).clone(),
             rpc_client.clone(),
@@ -321,38 +328,16 @@ impl nixie_common::rpc::Daemon for DaemonServer {
     }
 }
 
-// if `remote_fd` is Some, the `Ok` result must be a tuple of (pid_fd, ,Some(uvm_fd))
-fn duplicate_peer_fd(
-    pid: i32,
-    remote_fd: Option<i32>,
-) -> Result<(OwnedFd, Option<OwnedFd>), DaemonError> {
-    let pid_fd = match unsafe { syscall!(Sysno::pidfd_open, pid, nix::libc::PIDFD_NONBLOCK) } {
-        Ok(fd) => fd as c_int,
-        Err(e) => {
-            return Err(DaemonError::Errno(
-                "pidfd_open",
-                nix::errno::Errno::from_raw(e.into_raw()),
-            ));
-        }
-    };
-    if let Some(remote_fd) = remote_fd {
-        match unsafe { syscall!(Sysno::pidfd_getfd, pid_fd, remote_fd, 0) } {
-            Ok(fd) => {
-                let pid_fd = unsafe { OwnedFd::from_raw_fd(pid_fd) };
-                let uvm_fd = unsafe { OwnedFd::from_raw_fd(fd as c_int) };
-                Ok((pid_fd, Some(uvm_fd)))
-            }
-            Err(e) => {
-                let _ = nix::unistd::close(pid_fd);
-                Err(DaemonError::Errno(
-                    "pidfd_getfd",
-                    nix::errno::Errno::from_raw(e.into_raw()),
-                ))
-            }
-        }
-    } else {
-        Ok((unsafe { OwnedFd::from_raw_fd(pid_fd) }, None))
+fn open_peer_process(pid: i32) -> Result<OwnedHandle, DaemonError> {
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid as u32,
+        )
     }
+    .map_err(|e| DaemonError::Io("OpenProcess", e.into()))?;
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
 }
 
 // Mapping between real GPU indices and indices exposed to processes
