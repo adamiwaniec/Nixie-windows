@@ -1,5 +1,4 @@
 use chrono::Timelike;
-use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
@@ -55,11 +54,14 @@ pub fn init_tracing() {
         .with_writer(std::io::stdout)
         .with_timer(SystemTime)
         .with_filter(LevelFilter::DEBUG);
-    let temp_file_path = PathBuf::from_str(&format!(
-        "/tmp/tmp-nixie-daemon-{}.log",
+
+    // changed /tmp to %TEMP%
+    // Windows has no fixed temp dir for all procs
+    let temp_file_path = std::env::temp_dir().join(format!(
+        "tmp-nixie-daemon-{}.log",
         chrono::prelude::Local::now().format("%Y%m%d-%H%M%S")
-    ))
-    .unwrap();
+    ));
+
     let temp_file_handle =
         std::fs::File::create(&temp_file_path).expect("Failed to create temp log file");
     let file_layer = fmt::layer()
@@ -75,7 +77,7 @@ pub fn init_tracing() {
         .with(stdout_layer)
         .with(
             EnvFilter::builder()
-                .with_default_directive(Directive::from_str("nixie=trace").unwrap())
+                .with_default_directive(Directive::from_str("nixie=debug").unwrap())
                 .from_env_lossy(),
         )
         .init();

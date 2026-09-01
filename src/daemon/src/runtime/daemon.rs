@@ -69,7 +69,7 @@ impl Daemon {
         Self {
             daemon_path: PathBuf::from(nixie_common::DAEMON_PIPE_NAME),
             control_path: PathBuf::from(control::CONTROL_PATH),
-            buffer_path: PathBuf::from("/tmp/nixie.pagebuffer"),
+            buffer_path: std::env::temp_dir().join("nixie.pagebuffer"),
             shm_buffer_size,
             ram_buffer_size,
             shm_buffer_path: String::from("/nixie_shm_buffer"),
