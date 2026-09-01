@@ -89,7 +89,7 @@ fn init_mapped_gpu_memory() {
         let size = global_buf.size();
         check_cu_err!(
             cu_api::cuMemHostRegister_v2(
-                shm_buf_ptr as *mut nix::libc::c_void,
+                shm_buf_ptr as *mut core::ffi::c_void,
                 size,
                 cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE,
             ),

@@ -14,13 +14,12 @@ compile_error!("features `cuda-system` and `cuda-13` are mutually exclusive");
 compile_error!("features `cuda-12` and `cuda-13` are mutually exclusive");
 
 use cudarc::driver::sys::{CUstream, cudaError_enum};
-use nix::libc;
 use nixie_common::{
     shm::{AllocationTable, Shm, ShmGuard},
     shm_buffer::ShmBuffer,
     sync::IpcMutexGuard,
 };
-use std::{ffi::CString, sync::OnceLock};
+use std::sync::OnceLock;
 use utils::set_device;
 
 mod comm;
@@ -76,30 +75,10 @@ impl GenericData {
     }
 
     pub fn new(path: &str) -> Self {
-        let cpath = CString::new(path).unwrap();
         info_eprintln!("Creating shared memory at {}", path);
-        let shm_fd = unsafe {
-            libc::shm_open(
-                cpath.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT,
-                libc::S_IRUSR | libc::S_IWUSR,
-            )
-        };
-        if shm_fd < 0 {
-            panic!(
-                "Failed to open shared memory: {}",
-                nix::errno::Errno::last()
-            );
+        Self {
+            shm: Shm::init_at(path, Shm::SHM_STRUCT_SIZE).expect("Failed to init shared memory"),
         }
-        // create mmap
-        let shm = ShmGuard::new(
-            Shm::init_at(shm_fd, nixie_common::shm::Shm::SHM_STRUCT_SIZE)
-                .expect("Failed to init shared memory"),
-        );
-        // close fd but not unlink; daemon will be responsible for unlinking
-        unsafe { libc::close(shm_fd) };
-
-        Self { shm }
     }
 }
 

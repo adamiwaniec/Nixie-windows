@@ -1,4 +1,3 @@
-use nix::libc::{RTLD_NEXT, dlsym};
 use std::sync::OnceLock;
 
 use cudarc::driver::sys::cudaError_enum;

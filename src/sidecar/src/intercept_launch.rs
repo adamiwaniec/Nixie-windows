@@ -3,8 +3,8 @@ use std::{
     sync::{OnceLock, atomic::AtomicBool},
 };
 
+use core::ffi as libc;
 use cudarc::driver::sys::{CUgraphExec, CUstream, cudaError_enum};
-use nix::libc::{self, RTLD_NEXT, dlsym};
 use nixie_common::CUDA_CONTROL_PLANE_RESERVATION_SIZE;
 
 use crate::{
