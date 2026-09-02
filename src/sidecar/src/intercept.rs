@@ -1,6 +1,10 @@
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HMODULE, TRUE};
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows::core::w;
+
+use core::ffi as libc;
 use cudarc::driver::sys::{CUevent_flags_enum, CUstream, cudaError_enum};
-use nix::libc::{self, RTLD_NEXT, c_char, c_int, dlsym};
-use nix::sys::stat::mode_t;
 use nixie_common::shm::{AllocationEntry, PhysicalMemoryHandleId};
 use nixie_common::{
     CUDA_CONTROL_PLANE_RESERVATION_SIZE, GpuMemoryFreeUpdate, MAX_ALLOCATION_SIZE, MAX_GPUS,
@@ -20,17 +24,40 @@ use crate::schedule::{LaunchType, SCHED_CTL, require_reserved_memory};
 use crate::utils::{CudaContextGuard, get_device, set_device};
 use crate::{GENERIC_DATA, check_cu_err, cu_api, warn_eprintln};
 
+// no RTLD_NEXT on windows, so nothing hands us the next definition of a
+// symbol were shadowing. we have to load the real runtime here and look
+// symbols up in it
+pub(crate) fn real_cudart() -> HMODULE {
+    static REAL: OnceLock<usize> = OnceLock::new();
+    let addr = *REAL.get_or_init(|| {
+        // must not resolve back to us.
+        // once this is deployed as cudart64_12.dll
+        // the real one has to be loaded under a different name.
+        let h = unsafe { LoadLibraryW(w!("cudart64_12.dll")) }
+            .expect("Nixie: failed to load the real cudart");
+        h.0 as usize
+    });
+    HMODULE(addr as *mut core::ffi::c_void)
+}
+
 #[macro_export]
 macro_rules! generate_init_fn_as {
     ($func_type:ty, $func_name:expr, $init_func_name:ident) => {
         fn $init_func_name() -> $func_type {
             #[allow(clippy::macro_metavars_in_unsafe)]
             unsafe {
-                let func = dlsym(RTLD_NEXT, $func_name.as_ptr());
-                if func.is_null() {
-                    panic!("Failed to get original {:?} function", $func_name);
+                // $func_name is a &CStr, PCSTR needs *const u8
+                let proc = ::windows::Win32::System::LibraryLoader::GetProcAddress(
+                    $crate::intercept::real_cudart(),
+                    ::windows::core::PCSTR($func_name.as_ptr().cast()),
+                );
+                match proc {
+                    // spelling both sides of the transmute keeps clippy quiet
+                    Some(f) => {
+                        ::std::mem::transmute::<unsafe extern "system" fn() -> isize, $func_type>(f)
+                    }
+                    None => panic!("Failed to get original {:?} function", $func_name),
                 }
-                std::mem::transmute(func)
             }
         }
     };
