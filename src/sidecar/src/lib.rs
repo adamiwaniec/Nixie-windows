@@ -35,9 +35,11 @@ mod utils;
 
 /*
  * Expected workflow:
- * 1. Attached process opened /dev/nvidia-uvm, we record the fd
- *  * 1.1. Some applications may open and close /dev/nvidia-uvm multiple times; we delay to use it until they truly invoke CUDA APIs
- * 2. Process called cudaMalloc, we use the latest uvmfd
+ * 1. The loader calls DllMain when we get pulled in, and we initialize from there
+ *  * 1.1. on Linux this hung off an open() hook watching for /dev/nvidia-uvm, because
+ *         there was no load notification and the uvm fd was wanted anyway. They dont
+ *         apply here, so the whole delayed-init thing is gone.
+ * 2. process calls cudaMalloc and we are already set up.
  */
 
 struct CuStreamWrapper(CUstream);

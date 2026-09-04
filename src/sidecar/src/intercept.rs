@@ -571,12 +571,19 @@ pub extern "C" fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaErr
 
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: mode_t) -> c_int {
-    type OpenType = extern "C" fn(*const c_char, c_int, mode_t) -> c_int;
-    static OPEN_FN: OnceLock<OpenType> = OnceLock::new();
-    generate_init_fn!(OpenType, cr"open");
-    let open_func = OPEN_FN.get_or_init(init_fn);
-    let res = open_func(path, oflag, mode);
-    init_all_entrypoint();
-    res
+// replaces the open() hook, which was the only caller of init_all_entrypoint: the
+// sidecar relied on the app opening some file early in startup. Windows gives us a
+// real load notification instead, so nothing has to be guessed at.
+pub extern "system" fn DllMain(
+    _hinst: HINSTANCE,
+    reason: u32,
+    _reserved: *mut core::ffi::c_void,
+) -> BOOL {
+    if reason == DLL_PROCESS_ATTACH {
+        // cant block or load libraries under the loader lock, so hand off
+        std::thread::spawn(|| {
+            init_all_entrypoint();
+        });
+    }
+    TRUE
 }
