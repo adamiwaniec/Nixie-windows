@@ -59,7 +59,7 @@ pub extern "C" fn cudaGraphLaunch(graph: CUgraphExec, stream: CUstream) -> cudaE
 
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
-pub extern "C" fn cudaStreamCaptureBegin(stream: CUstream, mode: i32) -> cudaError_enum {
+pub extern "C" fn cudaStreamBeginCapture(stream: CUstream, mode: i32) -> cudaError_enum {
     type CudaStreamBeginCaptureType = extern "C" fn(CUstream, i32) -> cudaError_enum;
     static STREAM_CAPTURE_BEGIN_FN: OnceLock<CudaStreamBeginCaptureType> = OnceLock::new();
     generate_init_fn!(CudaStreamBeginCaptureType, cr"cudaStreamBeginCapture");
