@@ -25,6 +25,8 @@ use utils::set_device;
 mod comm;
 mod cu_api;
 mod env_config;
+#[cfg(windows)]
+mod forwarders;
 mod init;
 mod intercept;
 mod intercept_launch;

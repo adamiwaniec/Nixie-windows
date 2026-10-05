@@ -1,7 +1,7 @@
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HMODULE, TRUE};
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
-use windows::core::w;
+use windows::core::PCWSTR;
 
 use core::ffi as libc;
 use cudarc::driver::sys::{CUevent_flags_enum, CUstream, cudaError_enum};
@@ -35,8 +35,12 @@ pub(crate) fn real_cudart() -> HMODULE {
         // must not resolve back to us.
         // once this is deployed as cudart64_12.dll
         // the real one has to be loaded under a different name.
-        let h = unsafe { LoadLibraryW(w!("cudart64_12.dll")) }
-            .expect("Nixie: failed to load the real cudart");
+        // NIXIE_REAL_CUDART overrides it. name only, not a path, so the app's own copy is found
+        let name = std::env::var("NIXIE_REAL_CUDART")
+            .unwrap_or_else(|_| "cudart64_12_real.dll".to_string());
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }
+            .unwrap_or_else(|e| panic!("Nixie: failed to load the real cudart {name}: {e}"));
         h.0 as usize
     });
     HMODULE(addr as *mut core::ffi::c_void)

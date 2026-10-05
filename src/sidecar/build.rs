@@ -18,6 +18,9 @@ fn main() {
         println!("cargo:rustc-check-cfg=cfg({})", threshold.cfg);
     }
 
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        write_forwarders();
+    }
     if !feature_enabled("cuda-system") {
         return;
     }
@@ -98,4 +101,57 @@ fn parse_nvcc_version(stdout: &str) -> Option<(usize, usize)> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     Some((major, minor))
+}
+
+//windows: 
+// deployed as cudart64_12.dll, the sidecar has to export every symbol the real
+// runtime does. the ones we dont hook become PE forwarders to the renamed real dll.
+// names come from the real dll's export table (NIXIE_CUDART_DLL), minus our hooks.
+// they go in a .drectve section because link.exe rejects these forwarders on the
+// command line and in a .def file
+fn write_forwarders() {
+    println!("cargo:rerun-if-env-changed=NIXIE_CUDART_DLL");
+    println!("cargo:rerun-if-changed=src");
+    let mut directives = String::new();
+    if let Ok(dll) = std::env::var("NIXIE_CUDART_DLL") {
+        use object::Object;
+        println!("cargo:rerun-if-changed={dll}");
+        let data = std::fs::read(&dll).unwrap_or_else(|e| panic!("NIXIE_CUDART_DLL={dll}: {e}"));
+        let file = object::File::parse(&*data).expect("NIXIE_CUDART_DLL is not a PE file");
+        let hooks = hooked_names("src");
+        for export in file.exports().expect("cudart has no export table") {
+            let name = String::from_utf8_lossy(export.name());
+            if !hooks.contains(name.as_ref()) {
+                directives += &format!(" /EXPORT:{name}=cudart64_12_real.{name}");
+            }
+        }
+    } else {
+        println!("cargo:warning=NIXIE_CUDART_DLL not set, building without cudart forwarders");
+    }
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("forwarders.rs");
+    let src = format!(
+        "#[unsafe(link_section = \".drectve\")]\n#[used]\nstatic FORWARDERS: [u8; {}] = *b\"{directives} \";\n",
+        directives.len() + 1
+    );
+    std::fs::write(out, src).expect("failed to write forwarders.rs");
+}
+//every 'pub extern "C" fn' in src is a hook and has to stay a real export
+fn hooked_names(dir: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            names.extend(hooked_names(path.to_str().unwrap()));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (i, _) in text.match_indices("pub extern \"C\" fn ") {
+                let rest = &text[i + "pub extern \"C\" fn ".len()..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                names.insert(rest[..end].to_string());
+            }
+        }
+    }
+    names
 }
