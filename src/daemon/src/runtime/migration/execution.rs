@@ -1298,7 +1298,9 @@ fn check_location(buffer_id: &BufferId, expected: BufferLocation, actual: Buffer
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, num::NonZeroU32, time::Duration};
+    #[cfg(unix)]
+    use std::ffi::CString;
+    use std::{num::NonZeroU32, time::Duration};
 
     use nixie_common::{MAX_ALLOCATION_SIZE, MIN_ALLOCATION_SIZE};
 
@@ -1320,8 +1322,13 @@ mod tests {
             );
             let shm = Arc::new(ShmBufferManager::new(&name, 4 * MAX_ALLOCATION_SIZE).unwrap());
             // These tests need only the mapping, not a name accessible to a sidecar.
-            let name = CString::new(name).unwrap();
-            assert_eq!(unsafe { nix::libc::shm_unlink(name.as_ptr()) }, 0);
+
+            // only for unix
+            #[cfg(unix)]
+            {
+                let name = CString::new(name).unwrap();
+                assert_eq!(unsafe { nix::libc::shm_unlink(name.as_ptr()) }, 0);
+            }
             Self {
                 data: DataManagerHandle {
                     shm,
