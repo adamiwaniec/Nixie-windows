@@ -103,7 +103,7 @@ fn parse_nvcc_version(stdout: &str) -> Option<(usize, usize)> {
     Some((major, minor))
 }
 
-//windows: 
+//windows:
 // deployed as cudart64_12.dll, the sidecar has to export every symbol the real
 // runtime does. the ones we dont hook become PE forwarders to the renamed real dll.
 // names come from the real dll's export table (NIXIE_CUDART_DLL), minus our hooks.

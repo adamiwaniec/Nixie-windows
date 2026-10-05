@@ -348,8 +348,8 @@ impl Controllable for ControllableDaemon {
 }
 // Utils
 
-/* replaces the old UnixListenerGuard. the differences: 
-   - a pipe server is one instance per connection, 
+/* replaces the old UnixListenerGuard. the differences:
+   - a pipe server is one instance per connection,
      so a new inst must exist before the next client can connect.
    - there is no filesystem entry to remove afterward, so no Drop trait
 */
@@ -372,7 +372,7 @@ impl PipeListener {
     }
 
     pub async fn accept(&mut self) -> std::io::Result<NamedPipeServer> {
-        // waits for a client on the instance we already hold, then hands it 
+        // waits for a client on the instance we already hold, then hands it
         // that one and creates the next
         self.next.connect().await?;
         let connected = std::mem::replace(&mut self.next, ServerOptions::new().create(&self.name)?);

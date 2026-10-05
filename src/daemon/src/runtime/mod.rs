@@ -16,7 +16,7 @@ pub use daemon::Daemon;
 use nixie_common::{GlobalDeviceId, general::CallParameter};
 pub(crate) use schedule::{ClientState, Priority, PriorityLevel};
 
-/* removed get_user and socket_chown. they chowned the socket to the user so a daemon 
+/* removed get_user and socket_chown. they chowned the socket to the user so a daemon
    started by root was reachable. A win32 named pipe has no filesystem entry and no
    owner to change
 */

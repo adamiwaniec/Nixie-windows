@@ -258,7 +258,7 @@ impl Shm {
             return Err(e);
         }
 
-        // 1 hash per region and 1 id per lock derived off it, so the locks in a region 
+        // 1 hash per region and 1 id per lock derived off it, so the locks in a region
         // cannot collide with each other or with another region
         let hash = region_hash(name);
         unsafe {
