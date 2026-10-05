@@ -78,8 +78,10 @@ impl Drop for ShmBuffer {
         unsafe {
             libc::munmap(self.shm_addr as *mut libc::c_void, self.shm_size);
             libc::close(self.shm_fd);
-            if self.is_creator {
-                libc::shm_unlink(self.shm_path.as_ptr() as *const i8);
+            if self.is_creator
+                && let Ok(path) = std::ffi::CString::new(self.shm_path.as_str())
+            {
+                libc::shm_unlink(path.as_ptr());
             }
         }
     }
